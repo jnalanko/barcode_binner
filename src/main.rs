@@ -41,7 +41,7 @@ fn main() {
     // Create writers for each barcode
     let mut writers = vec![];
     for barcode_id in 0..n_barcodes {
-        let filename = format!("{}-barcode{}.fastq", out_prefix.to_str().unwrap(), barcode_id);
+        let filename = format!("{}-barcode{}.fastq", out_prefix.to_str().unwrap(), barcode_id + 1); // 1-based indexing
         writers.push(jseqio::writer::DynamicFastXWriter::new_to_file(&filename).unwrap());
     }
     let mixed_filename = format!("{}-mixed.fastq", out_prefix.to_str().unwrap());
@@ -77,7 +77,7 @@ fn main() {
     for (idx, count) in written_counts.iter().enumerate() {
         #[allow(clippy::comparison_chain)]
         if idx < n_barcodes {
-            eprintln!("Found {} reads with barcode {}", count, idx);
+            eprintln!("Found {} reads with barcode {}", count, idx + 1); // 1-based indexing
         } else if idx == n_barcodes {
             eprintln!("Found {} reads with multiple barcodes", count);
         } else {
