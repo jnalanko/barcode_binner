@@ -9,6 +9,16 @@ fn read_barcodes(filename: &str) -> Vec<Vec<u8>> {
     file.lines().map(|x| x.unwrap().as_bytes().to_owned()).collect()
 }
 
+fn get_reverse_complement(seq: &[u8]) -> Vec<u8> {
+    seq.iter().rev().map(|&x| match x {
+        b'A' => b'T',
+        b'T' => b'A',
+        b'C' => b'G',
+        b'G' => b'C',
+        _ => panic!("Invalid character in barcodes: ASCII value {}", x),
+    }).collect()
+}
+
 fn main() {
 
     let cli = Command::new("barcode-binner")
@@ -33,8 +43,11 @@ fn main() {
     let out_prefix = matches.get_one::<std::path::PathBuf>("out-prefix").unwrap();
 
     let barcodes = read_barcodes(barcode_filepath.to_str().unwrap());
+    let rc_barcodes = barcodes.iter().map(|x| get_reverse_complement(x)).collect::<Vec<_>>(); 
+    let barcodes_and_rc = barcodes.iter().chain(rc_barcodes.iter()).collect::<Vec<_>>();
+
     let n_barcodes = barcodes.len();
-    let ac = AhoCorasick::new(barcodes).unwrap();
+    let aho_corasick = AhoCorasick::new(barcodes_and_rc).unwrap();
 
     let mut reader = jseqio::reader::DynamicFastXReader::from_stdin().unwrap();
     
@@ -53,8 +66,8 @@ fn main() {
     while let Some(rec) = reader.read_next().unwrap() {
         let mut barcode_id: Option<usize> = None;
         let mut have_multiple = false;
-        for mat in ac.find_iter(rec.seq) {
-            let id = mat.pattern().as_usize();
+        for mat in aho_corasick.find_iter(rec.seq) {
+            let id = mat.pattern().as_usize() % n_barcodes; // Reverse complements are at the second half, hence modulo
             if barcode_id.is_some_and(|x| x != id) {
                 have_multiple = true;
             }
