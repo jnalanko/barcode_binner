@@ -61,13 +61,15 @@ fn main() {
     writers.push(jseqio::writer::DynamicFastXWriter::new_to_file(&mixed_filename).unwrap());
     let none_filename = format!("{}-none.fastq", out_prefix.to_str().unwrap());
     writers.push(jseqio::writer::DynamicFastXWriter::new_to_file(&none_filename).unwrap());
-    let mut written_counts = vec![0; writers.len()];
+    let mut written_counts = vec![0_usize; writers.len()];
+    let mut hit_counts = vec![0_usize; n_barcodes];
 
     while let Some(rec) = reader.read_next().unwrap() {
         let mut barcode_id: Option<usize> = None;
         let mut have_multiple = false;
         for mat in aho_corasick.find_iter(rec.seq) {
             let id = mat.pattern().as_usize() % n_barcodes; // Reverse complements are at the second half, hence modulo
+            hit_counts[id] += 1;
             if barcode_id.is_some_and(|x| x != id) {
                 have_multiple = true;
             }
@@ -96,6 +98,10 @@ fn main() {
         } else {
             eprintln!("Found {} reads with no barcodes", count);
         }
+    }
+
+    for (idx, count) in hit_counts.iter().enumerate() {
+        eprintln!("{} total occurrences of barcode {}", count, idx+1); // 1-based indexing
     }
 
 }
