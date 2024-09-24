@@ -50,21 +50,37 @@ fn get_reverse_complement(seq: &[u8]) -> Vec<u8> {
 }
 
 // Score should be between 0 and 1
-fn identify_barcodes_smith_waterman(barcodes: &[&[u8]], read: &[u8], score_threshold: f64) -> Vec<usize> {
+// Might return duplicates
+fn identify_barcodes_smith_waterman(barcodes: &Vec<Vec<u8>>, rc_barcodes: &Vec<Vec<u8>>, read: &[u8], score_threshold: f64) -> Vec<usize> {
     assert!(score_threshold >= 0.0 && score_threshold <= 1.0);
+    assert_eq!(barcodes.len(), rc_barcodes.len());
+
     let mut found_barcodes = Vec::<usize>::new();
-    for (i, &barcode) in barcodes.iter().enumerate() {
-        let score = smith_waterman(barcode, read);
+
+    // Search forward barcodes
+    for (i, barcode) in barcodes.iter().enumerate() {
+        let score = smith_waterman(&barcode, read);
         let fscore = score as f64 / barcode.len() as f64;
         if fscore >= score_threshold {
             found_barcodes.push(i);
         }
     }
+
+    // Search reverse barcodes
+    for (i, barcode) in rc_barcodes.iter().enumerate() {
+        let score = smith_waterman(&barcode, read);
+        let fscore = score as f64 / barcode.len() as f64;
+        if fscore >= score_threshold {
+            found_barcodes.push(i);
+        }
+    }
+
     found_barcodes
 }
 
 // The automaton should have the barcodes, and then their reverse complements
-fn identify_barcodes_aho_corasick(automaton: AhoCorasick, read: &[u8]) -> Vec<usize> {
+// Mi
+fn identify_barcodes_aho_corasick(automaton: &AhoCorasick, read: &[u8]) -> Vec<usize> {
     let mut found_barcodes = Vec::<usize>::new();
     for mat in automaton.find_iter(read) {
         let n_barcodes = automaton.patterns_len() / 2;
@@ -72,9 +88,6 @@ fn identify_barcodes_aho_corasick(automaton: AhoCorasick, read: &[u8]) -> Vec<us
         found_barcodes.push(id);
     }
 
-    // We might have the reverse complement as well as forward, so we need to deduplicate
-    found_barcodes.sort();
-    found_barcodes.dedup();
     found_barcodes
 }
 
@@ -84,6 +97,7 @@ fn main() {
         .author("Jarno N. Alanko <alanko.jarno@gmail.com>")
         .arg_required_else_help(true)
         .about("Reads fastq data from standard input, writes to fastq files by barcode")
+        .long_about("Runs exact matching using the Aho-Corasick automaton, unless --identity-threshold is given, in which case approximate matching is run instead, using the Smith-Waterman, which is much slower.")
         .arg(Arg::new("out-prefix")
             .long("out-prefix")
             .short('o')
@@ -95,11 +109,17 @@ fn main() {
             .short('b')
             .help("File with barcode sequences, one per line") 
             .value_parser(clap::value_parser!(std::path::PathBuf))
+        ).arg(Arg::new("identity-threshold")
+            .long("identity-threshold")
+            .short('t')
+            .help("Run Smith-Waterman scoring with the given identity threshold (between 0 and 1).")
+            .value_parser(clap::value_parser!(f64))
         );
 
     let matches = cli.get_matches();
     let barcode_filepath = matches.get_one::<std::path::PathBuf>("barcodes").unwrap();
     let out_prefix = matches.get_one::<std::path::PathBuf>("out-prefix").unwrap();
+    let identity_threshold = matches.get_one::<f64>("identity-threshold");
 
     let barcodes = read_barcodes(barcode_filepath.to_str().unwrap());
     let rc_barcodes = barcodes.iter().map(|x| get_reverse_complement(x)).collect::<Vec<_>>(); 
@@ -124,25 +144,24 @@ fn main() {
     let mut hit_counts = vec![0_usize; n_barcodes];
 
     while let Some(rec) = reader.read_next().unwrap() {
-        let mut barcode_id: Option<usize> = None;
-        let mut have_multiple = false;
-        for mat in aho_corasick.find_iter(rec.seq) {
-            let id = mat.pattern().as_usize() % n_barcodes; // Reverse complements are at the second half, hence modulo
-            hit_counts[id] += 1;
-            if barcode_id.is_some_and(|x| x != id) {
-                have_multiple = true;
-            }
-            barcode_id = Some(id);
+        let mut found_barcodes = if let Some(t) = identity_threshold {
+            identify_barcodes_smith_waterman(&barcodes, &rc_barcodes, rec.seq, *t)
+        } else {
+            identify_barcodes_aho_corasick(&aho_corasick, rec.seq)
+        };
+
+        // We might have the reverse complement as well as forward, or we might have multiple matches, so we need to deduplicate
+        found_barcodes.sort();
+        found_barcodes.dedup();
+
+        for &bc in found_barcodes.iter() {
+            hit_counts[bc] += 1;
         }
-        let writer_idx = match barcode_id {
-            Some(id) => {
-                if have_multiple {
-                    n_barcodes // Mixed writer
-                } else {
-                    id
-                }
-            },
-            None => n_barcodes+1 // None writer
+
+        let writer_idx = match found_barcodes.len(){
+            2.. => n_barcodes, // Mixed writer
+            1 => *found_barcodes.first().unwrap(), // Single writer
+            0 => n_barcodes+1 // None writer
         };
         writers[writer_idx].write_ref_record(&rec).unwrap();
         written_counts[writer_idx] += 1;
