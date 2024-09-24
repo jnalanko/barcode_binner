@@ -179,7 +179,7 @@ fn main() {
     }
 
     for (idx, count) in hit_counts.iter().enumerate() {
-        eprintln!("{} total occurrences of barcode {}", count, idx+1); // 1-based indexing
+        eprintln!("{} total hits for barcode {}", count, idx+1); // 1-based indexing
     }
 
 }
