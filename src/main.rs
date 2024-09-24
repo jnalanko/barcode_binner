@@ -1,8 +1,38 @@
-use std::{io::BufRead, vec};
+use std::{cmp::max, io::BufRead, vec};
 
 use aho_corasick::AhoCorasick;
 use clap::{Arg, Command};
 use jseqio::writer::SeqRecordWriter;
+
+// Local alignment of needle against the haystack.
+// Returns the match score of the best match. The maximum possible score
+// is the length of the shorter sequence. 
+fn smith_waterman(needle: &[u8], haystack: &[u8]) -> usize {
+    let m = needle.len();
+    let n = haystack.len();
+
+    let mut score_matrix = vec![vec![0_isize; n + 1]; m + 1];
+    let mut max_score = 0;
+
+    // Fill the score matrix
+    for i in 1..=m {
+        for j in 1..=n {
+            let match_mismatch_score = if needle[i - 1] == haystack[j - 1] { 1 } else { 0 } as isize;
+
+            score_matrix[i][j] = max(0, max(
+                score_matrix[i - 1][j - 1] + match_mismatch_score,
+                max(
+                    score_matrix[i - 1][j] - 1,
+                    score_matrix[i][j - 1] - 1,
+                ),
+            ));
+
+            max_score = max(max_score, score_matrix[i][j]);
+        }
+    }
+
+    max_score as usize
+}
 
 fn read_barcodes(filename: &str) -> Vec<Vec<u8>> {
     let file = std::io::BufReader::new(std::fs::File::open(filename).unwrap());
@@ -104,4 +134,20 @@ fn main() {
         eprintln!("{} total occurrences of barcode {}", count, idx+1); // 1-based indexing
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn test_smith_waterman(){
+        let s1 = b"TAGATACGTACGTACGTGAAG";
+        let s2 =      b"ACGTAAGTACGT"; // 1 substitution
+        let s3 =      b"ACTACGTACXXGT"; // 1 dels, 2 inserts
+
+        assert_eq!(smith_waterman(s2, s1), s2.len()-1);
+        assert_eq!(smith_waterman(s3, s1), 12-1-2); // 12 matches, 1 del, 2 inserts
+    }
 }
