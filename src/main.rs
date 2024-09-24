@@ -49,6 +49,35 @@ fn get_reverse_complement(seq: &[u8]) -> Vec<u8> {
     }).collect()
 }
 
+// Score should be between 0 and 1
+fn identify_barcodes_smith_waterman(barcodes: &[&[u8]], read: &[u8], score_threshold: f64) -> Vec<usize> {
+    assert!(score_threshold >= 0.0 && score_threshold <= 1.0);
+    let mut found_barcodes = Vec::<usize>::new();
+    for (i, &barcode) in barcodes.iter().enumerate() {
+        let score = smith_waterman(barcode, read);
+        let fscore = score as f64 / barcode.len() as f64;
+        if fscore >= score_threshold {
+            found_barcodes.push(i);
+        }
+    }
+    found_barcodes
+}
+
+// The automaton should have the barcodes, and then their reverse complements
+fn identify_barcodes_aho_corasick(automaton: AhoCorasick, read: &[u8]) -> Vec<usize> {
+    let mut found_barcodes = Vec::<usize>::new();
+    for mat in automaton.find_iter(read) {
+        let n_barcodes = automaton.patterns_len() / 2;
+        let id = mat.pattern().as_usize() % n_barcodes; // Reverse complements are at the second half, hence modulo
+        found_barcodes.push(id);
+    }
+
+    // We might have the reverse complement as well as forward, so we need to deduplicate
+    found_barcodes.sort();
+    found_barcodes.dedup();
+    found_barcodes
+}
+
 fn main() {
 
     let cli = Command::new("barcode-binner")
