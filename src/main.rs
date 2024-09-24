@@ -150,13 +150,13 @@ fn main() {
             identify_barcodes_aho_corasick(&aho_corasick, rec.seq)
         };
 
-        // We might have the reverse complement as well as forward, or we might have multiple matches, so we need to deduplicate
-        found_barcodes.sort();
-        found_barcodes.dedup();
-
         for &bc in found_barcodes.iter() {
             hit_counts[bc] += 1;
         }
+
+        // We might have the reverse complement as well as forward, or we might have multiple matches, so we need to deduplicate
+        found_barcodes.sort();
+        found_barcodes.dedup();
 
         let writer_idx = match found_barcodes.len(){
             2.. => n_barcodes, // Mixed writer
