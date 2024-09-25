@@ -3,6 +3,7 @@ use std::{cmp::max, io::BufRead, vec};
 use aho_corasick::AhoCorasick;
 use clap::{Arg, Command};
 use jseqio::writer::SeqRecordWriter;
+use rayon::prelude::*;
 
 // Local alignment of needle against the haystack.
 // Returns the match score of the best match. The maximum possible score
@@ -111,15 +112,22 @@ fn main() {
             .value_parser(clap::value_parser!(std::path::PathBuf))
         ).arg(Arg::new("identity-threshold")
             .long("identity-threshold")
-            .short('t')
+            .short('d')
             .help("Run Smith-Waterman scoring with the given identity threshold (between 0 and 1).")
             .value_parser(clap::value_parser!(f64))
+        ).arg(Arg::new("n-threads")
+            .long("n-threads")
+            .short('t')
+            .help("Number of parallel threads.")
+            .default_value("1")
+            .value_parser(clap::value_parser!(usize))
         );
 
     let matches = cli.get_matches();
     let barcode_filepath = matches.get_one::<std::path::PathBuf>("barcodes").unwrap();
     let out_prefix = matches.get_one::<std::path::PathBuf>("out-prefix").unwrap();
     let identity_threshold = matches.get_one::<f64>("identity-threshold");
+    let n_threads = *matches.get_one::<usize>("n-threads").unwrap();
 
     let barcodes = read_barcodes(barcode_filepath.to_str().unwrap());
     let rc_barcodes = barcodes.iter().map(|x| get_reverse_complement(x)).collect::<Vec<_>>(); 
@@ -128,9 +136,7 @@ fn main() {
     let n_barcodes = barcodes.len();
     let aho_corasick = AhoCorasick::new(barcodes_and_rc).unwrap();
 
-    let mut reader = jseqio::reader::DynamicFastXReader::from_stdin().unwrap();
-    
-    // Create writers for each barcode
+    // Create writing streams for each barcode
     let mut writers = vec![];
     for barcode_id in 0..n_barcodes {
         let filename = format!("{}-barcode{}.fastq", out_prefix.to_str().unwrap(), barcode_id + 1); // 1-based indexing
@@ -143,6 +149,71 @@ fn main() {
     let mut written_counts = vec![0_usize; writers.len()];
     let mut hit_counts = vec![0_usize; n_barcodes];
 
+    let (writer_thread_send, writer_thread_recv) = crossbeam::channel::unbounded::<(usize, Vec<usize>)>(); // Pairs (seq index, vector of found barcodes)
+
+    eprintln!("Reading data into memory...");
+    let reader = jseqio::reader::DynamicFastXReader::from_stdin().unwrap();
+    let input_db = reader.into_db().unwrap();
+    eprintln!("Done reading data into memory.");
+
+    std::thread::scope(|scope|{
+        // Create writer
+        let writer_handle = scope.spawn( || {
+            while let Ok((seq_idx, mut found_barcodes)) = writer_thread_recv.recv() {
+                // Record hit counts before deduplication
+                for &bc in found_barcodes.iter() {
+                    hit_counts[bc] += 1;
+                }
+
+                // We might have the reverse complement as well as forward, or we might have multiple matches, so we need to deduplicate
+                found_barcodes.sort();
+                found_barcodes.dedup();
+
+                let writer_idx = match found_barcodes.len(){
+                    2.. => n_barcodes, // Mixed writer
+                    1 => *found_barcodes.first().unwrap(), // Single writer
+                    0 => n_barcodes+1 // None writer
+                };
+                writers[writer_idx].write_ref_record(&input_db.get(seq_idx)).unwrap();
+                written_counts[writer_idx] += 1;
+            }
+        });
+
+        // Create workers that send results to the writer
+        let thread_pool = rayon::ThreadPoolBuilder::new().num_threads(n_threads).build().unwrap();
+        thread_pool.install(|| {
+            (0..input_db.sequence_count()).into_par_iter().for_each(|seq_idx| {
+                let rec = input_db.get(seq_idx);
+                let found_barcodes = if let Some(t) = identity_threshold {
+                    identify_barcodes_smith_waterman(&barcodes, &rc_barcodes, rec.seq, *t)
+                } else {
+                    identify_barcodes_aho_corasick(&aho_corasick, rec.seq)
+                };
+                writer_thread_send.send((seq_idx, found_barcodes)).unwrap();
+            });
+        });
+
+        drop(writer_thread_send); // Close the channel
+        writer_handle.join().unwrap(); // Wait for the writer to finish
+    });
+
+    for (idx, count) in written_counts.iter().enumerate() {
+        #[allow(clippy::comparison_chain)]
+        if idx < n_barcodes {
+            eprintln!("Found {} reads with barcode {}", count, idx + 1); // 1-based indexing
+        } else if idx == n_barcodes {
+            eprintln!("Found {} reads with multiple barcodes", count);
+        } else {
+            eprintln!("Found {} reads with no barcodes", count);
+        }
+    }
+
+    for (idx, count) in hit_counts.iter().enumerate() {
+        eprintln!("{} total hits for barcode {}", count, idx+1); // 1-based indexing
+    }
+
+
+/* 
     while let Some(rec) = reader.read_next().unwrap() {
         let mut found_barcodes = if let Some(t) = identity_threshold {
             identify_barcodes_smith_waterman(&barcodes, &rc_barcodes, rec.seq, *t)
@@ -181,6 +252,7 @@ fn main() {
     for (idx, count) in hit_counts.iter().enumerate() {
         eprintln!("{} total hits for barcode {}", count, idx+1); // 1-based indexing
     }
+    */
 
 }
 
