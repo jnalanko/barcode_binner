@@ -51,45 +51,54 @@ fn get_reverse_complement(seq: &[u8]) -> Vec<u8> {
 }
 
 // Score should be between 0 and 1
-// Might return duplicates
-fn identify_barcodes_smith_waterman(barcodes: &Vec<Vec<u8>>, rc_barcodes: &Vec<Vec<u8>>, read: &[u8], score_threshold: f64) -> Vec<usize> {
+// May return duplicates
+fn identify_barcodes_smith_waterman(barcodes: &Vec<Vec<u8>>, rc_barcodes: &Vec<Vec<u8>>, read: &[u8], score_threshold: f64) -> (Vec<usize>, Vec<usize>) {
     assert!(score_threshold >= 0.0 && score_threshold <= 1.0);
     assert_eq!(barcodes.len(), rc_barcodes.len());
 
-    let mut found_barcodes = Vec::<usize>::new();
+    let mut found_fw_barcodes = Vec::<usize>::new();
 
     // Search forward barcodes
     for (i, barcode) in barcodes.iter().enumerate() {
         let score = smith_waterman(&barcode, read);
         let fscore = score as f64 / barcode.len() as f64;
         if fscore >= score_threshold {
-            found_barcodes.push(i);
+            found_fw_barcodes.push(i);
         }
     }
 
+    let mut found_rc_barcodes = Vec::<usize>::new();
     // Search reverse barcodes
     for (i, barcode) in rc_barcodes.iter().enumerate() {
         let score = smith_waterman(&barcode, read);
         let fscore = score as f64 / barcode.len() as f64;
         if fscore >= score_threshold {
-            found_barcodes.push(i);
+            found_rc_barcodes.push(i);
         }
     }
 
-    found_barcodes
+    (found_fw_barcodes, found_rc_barcodes)
 }
 
 // The automaton should have the barcodes, and then their reverse complements
-// Mi
-fn identify_barcodes_aho_corasick(automaton: &AhoCorasick, read: &[u8]) -> Vec<usize> {
-    let mut found_barcodes = Vec::<usize>::new();
+// May return duplicates
+fn identify_barcodes_aho_corasick(automaton: &AhoCorasick, read: &[u8]) -> (Vec<usize>, Vec<usize>) {
+    let mut found_fw_barcodes = Vec::<usize>::new();
+    let mut found_rc_barcodes = Vec::<usize>::new();
     for mat in automaton.find_iter(read) {
+        let id = mat.pattern().as_usize();
+
+        // Reverse complements are at the second half
         let n_barcodes = automaton.patterns_len() / 2;
-        let id = mat.pattern().as_usize() % n_barcodes; // Reverse complements are at the second half, hence modulo
-        found_barcodes.push(id);
+
+        if id < n_barcodes {
+            found_fw_barcodes.push(id);
+        } else {
+            found_rc_barcodes.push(id % n_barcodes);
+        }
     }
 
-    found_barcodes
+    (found_fw_barcodes, found_rc_barcodes)
 }
 
 fn main() {
@@ -147,9 +156,10 @@ fn main() {
     let none_filename = format!("{}-none.fastq", out_prefix.to_str().unwrap());
     writers.push(jseqio::writer::DynamicFastXWriter::new_to_file(&none_filename).unwrap());
     let mut written_counts = vec![0_usize; writers.len()];
-    let mut hit_counts = vec![0_usize; n_barcodes];
+    let mut fw_hit_counts = vec![0_usize; n_barcodes];
+    let mut rc_hit_counts = vec![0_usize; n_barcodes];
 
-    let (writer_thread_send, writer_thread_recv) = crossbeam::channel::unbounded::<(usize, Vec<usize>)>(); // Pairs (seq index, vector of found barcodes)
+    let (writer_thread_send, writer_thread_recv) = crossbeam::channel::unbounded::<(usize, Vec<usize>, Vec<usize>)>(); // Pairs (seq index, vector of found forward barcodes, vector of found reverse barcodes)
 
     eprintln!("Reading data into memory...");
     let reader = jseqio::reader::DynamicFastXReader::from_stdin().unwrap();
@@ -159,13 +169,20 @@ fn main() {
     std::thread::scope(|scope|{
         // Create writer
         let writer_handle = scope.spawn( || {
-            while let Ok((seq_idx, mut found_barcodes)) = writer_thread_recv.recv() {
+            while let Ok((seq_idx, found_fw_barcodes, found_rc_barcodes)) = writer_thread_recv.recv() {
                 // Record hit counts before deduplication
-                for &bc in found_barcodes.iter() {
-                    hit_counts[bc] += 1;
+                for &bc in found_fw_barcodes.iter() {
+                    fw_hit_counts[bc] += 1;
                 }
 
-                // We might have the reverse complement as well as forward, or we might have multiple matches, so we need to deduplicate
+                for &bc in found_rc_barcodes.iter() {
+                    rc_hit_counts[bc] += 1;
+                }
+
+                // Figure out the distinct barcodes in either orientation
+                // We might have multiple matches, so we need to deduplicate
+                let mut found_barcodes = found_fw_barcodes;
+                found_barcodes.extend(found_rc_barcodes);
                 found_barcodes.sort();
                 found_barcodes.dedup();
 
@@ -184,12 +201,12 @@ fn main() {
         thread_pool.install(|| {
             (0..input_db.sequence_count()).into_par_iter().for_each(|seq_idx| {
                 let rec = input_db.get(seq_idx);
-                let found_barcodes = if let Some(t) = identity_threshold {
+                let (found_fw_barcodes, found_rc_barcodes) = if let Some(t) = identity_threshold {
                     identify_barcodes_smith_waterman(&barcodes, &rc_barcodes, rec.seq, *t)
                 } else {
                     identify_barcodes_aho_corasick(&aho_corasick, rec.seq)
                 };
-                writer_thread_send.send((seq_idx, found_barcodes)).unwrap();
+                writer_thread_send.send((seq_idx, found_fw_barcodes, found_rc_barcodes)).unwrap();
             });
         });
 
@@ -208,51 +225,11 @@ fn main() {
         }
     }
 
-    for (idx, count) in hit_counts.iter().enumerate() {
-        eprintln!("{} total hits for barcode {}", count, idx+1); // 1-based indexing
+    for bc in 0..n_barcodes{
+        let fw = fw_hit_counts[bc];
+        let rc = rc_hit_counts[bc];
+        eprintln!("{} total hits for barcode {} ({} fw, {} rc)", fw+rc, bc+1, fw, rc); // 1-based indexing
     }
-
-
-/* 
-    while let Some(rec) = reader.read_next().unwrap() {
-        let mut found_barcodes = if let Some(t) = identity_threshold {
-            identify_barcodes_smith_waterman(&barcodes, &rc_barcodes, rec.seq, *t)
-        } else {
-            identify_barcodes_aho_corasick(&aho_corasick, rec.seq)
-        };
-
-        for &bc in found_barcodes.iter() {
-            hit_counts[bc] += 1;
-        }
-
-        // We might have the reverse complement as well as forward, or we might have multiple matches, so we need to deduplicate
-        found_barcodes.sort();
-        found_barcodes.dedup();
-
-        let writer_idx = match found_barcodes.len(){
-            2.. => n_barcodes, // Mixed writer
-            1 => *found_barcodes.first().unwrap(), // Single writer
-            0 => n_barcodes+1 // None writer
-        };
-        writers[writer_idx].write_ref_record(&rec).unwrap();
-        written_counts[writer_idx] += 1;
-    }
-    
-    for (idx, count) in written_counts.iter().enumerate() {
-        #[allow(clippy::comparison_chain)]
-        if idx < n_barcodes {
-            eprintln!("Found {} reads with barcode {}", count, idx + 1); // 1-based indexing
-        } else if idx == n_barcodes {
-            eprintln!("Found {} reads with multiple barcodes", count);
-        } else {
-            eprintln!("Found {} reads with no barcodes", count);
-        }
-    }
-
-    for (idx, count) in hit_counts.iter().enumerate() {
-        eprintln!("{} total hits for barcode {}", count, idx+1); // 1-based indexing
-    }
-    */
 
 }
 
